@@ -263,17 +263,17 @@ if args.keras:
 
     forward = Sequential()
     # forward.add(LSTM(output_dim=noutput, input_dim=ninput, input_length=nstates, return_sequences=True))
-    forward.add(LSTM(output_dim=noutput, input_dim=ninput, input_length=5000, return_sequences=False, batch_input_shape=(batch_size, timesteps, data_dim)))
+    forward.add(LSTM(output_dim=noutput, return_sequences=False))
     forward.add(Dropout(0.2))
 
     backward = Sequential()
     # backward.add(LSTM(output_dim=noutput, input_dim=ninput, return_sequences=True, go_backwards=True, input_length=nstates))
-    backward.add(LSTM(output_dim=noutput, input_dim=ninput, go_backwards=True, input_length=5000, return_sequences=False))
+    backward.add(LSTM(output_dim=noutput, go_backwards=True, return_sequences=False))
     backward.add(Dropout(0.2))
 
     model = Sequential()
     model.add(Merge([forward, backward], mode='concat'))
-    model.add(Dense(input_dim=5000*2, output_dim=5000, activation='softmax'))
+    model.add(Dense(output_dim=noutput, activation='softmax'))
 
     model.compile(optimizer=Adam(), loss='binary_crossentropy')
 
