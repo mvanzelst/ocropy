@@ -1,7 +1,13 @@
-#!/usr/bin/env python
+#!/usr/bin/env python2
 
 import random as pyrandom
 import re
+
+from keras.engine import Merge
+from keras.layers import LSTM, Activation, Dense, Dropout
+from keras.models import Sequential
+from keras.optimizers import Adam
+from keras.utils.np_utils import to_categorical
 from pylab import *
 import os.path
 import ocrolib
@@ -11,6 +17,7 @@ import numpy
 from ocrolib import lineest
 import ocrolib.lstm as lstm
 import traceback
+import unicodedata
 
 numpy.seterr(divide='raise',over='raise',invalid='raise',under='ignore')
 
@@ -33,6 +40,8 @@ parser.add_argument("-c","--codec",default=[],nargs='*',
 # learning
 parser.add_argument("-C","--clstm",action="store_true",
                     help="use C++ LSTM")
+parser.add_argument("-K","--keras",action="store_true",
+                    help="use Keras")
 parser.add_argument("-r","--lrate",type=float,default=1e-4,
                     help="LSTM learning rate, default: %(default)s")
 parser.add_argument("-S","--hiddensize",type=int,default=100,
@@ -245,6 +254,32 @@ def plot_network_info(network,transcript,pred,gta):
 
 start = args.start if args.start>=0 else network.last_trial
 
+if args.keras:
+    ninput = args.height
+    nstates = args.hiddensize
+    noutput = codec.size()
+
+    model = Sequential()
+
+    forward = Sequential()
+    # forward.add(LSTM(output_dim=noutput, input_dim=ninput, input_length=nstates, return_sequences=True))
+    forward.add(LSTM(output_dim=noutput, input_dim=ninput, input_length=5000, return_sequences=False))
+    forward.add(Dropout(0.2))
+
+    backward = Sequential()
+    # backward.add(LSTM(output_dim=noutput, input_dim=ninput, return_sequences=True, go_backwards=True, input_length=nstates))
+    backward.add(LSTM(output_dim=noutput, input_dim=ninput, go_backwards=True, input_length=5000, return_sequences=False))
+    backward.add(Dropout(0.2))
+
+    model = Sequential()
+    model.add(Merge([forward, backward], mode='concat'))
+    model.add(Dense(input_dim=noutput*2, output_dim=noutput, activation='softmax'))
+
+    model.compile(optimizer=Adam(), loss='categorical_crossentropy')
+
+trainingData = list()
+trainingLabels = list()
+
 for trial in range(start,args.ntrain):
     network.last_trial = trial+1
 
@@ -282,6 +317,14 @@ for trial in range(start,args.ntrain):
         w = line.shape[1]
         line = vstack([zeros((args.pad,w)),line,zeros((args.pad,w))])
     cs = array(codec.encode(transcript),'i')
+    target = lstm.make_target(cs, codec.size());
+    targetTimesteps = np.vstack((target, np.zeros((5000-target.shape[0], codec.size()))))
+    trainingLabels.append(targetTimesteps.astype(int))
+
+    lineTimesteps = np.vstack((line, np.zeros((5000-line.shape[0], 48))))
+    trainingData.append(lineTimesteps)
+
+    continue
     try:
         pcs = network.trainSequence(line,cs,update=do_update,key=fname)
     except FloatingPointError as e:
@@ -319,3 +362,5 @@ for trial in range(start,args.ntrain):
             draw()
             savefig("%s-%08d.png"%(args.movie,trial),bbox_inches=0)
 
+npTrainingData = np.asarray(trainingData)
+model.fit({'lstm_input_1': npTrainingData, 'lstm_input_2': npTrainingData}, np.asarray(trainingLabels), verbose=1)
