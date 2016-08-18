@@ -4,7 +4,8 @@ import random as pyrandom
 import re
 
 from keras.engine import Merge
-from keras.layers import LSTM, Activation, Dense, Dropout, Bidirectional, Embedding
+from keras.layers import LSTM, Activation, Dense, Dropout, Bidirectional, Embedding, TimeDistributed, \
+    TimeDistributedDense
 from keras.models import Sequential
 from keras.optimizers import Adam
 from keras.utils.np_utils import to_categorical
@@ -264,10 +265,11 @@ if args.keras:
 
     model = Sequential()
     #model.add(Embedding(data_dim, data_dim, input_length=timesteps))
-    model.add(Bidirectional(LSTM(200, return_sequences=True), input_shape=(timesteps, data_dim), merge_mode='sum'))
-    model.add(Activation('softmax'))
+    model.add(LSTM(nstates, batch_input_shape=(1, timesteps, data_dim), return_sequences=True))
+    model.add(Activation('relu'))
+    model.add(TimeDistributedDense(1, activation='softmax'))
 
-    model.compile(optimizer=Adam(), loss='categorical_crossentropy')
+    model.compile(optimizer=Adam(), loss='binary_crossentropy')
 
 trainingData = list()
 trainingLabels = list()
@@ -311,7 +313,7 @@ for trial in range(start,args.ntrain):
         line = vstack([zeros((args.pad,w)),line,zeros((args.pad,w))])
     cs = array(codec.encode(transcript),'i')
     target = lstm.make_target(cs, codec.size());
-    targetTimesteps = np.vstack((target, np.zeros((200-target.shape[0], codec.size()))))
+    targetTimesteps = np.vstack((target, np.zeros((5000-target.shape[0], codec.size()))))
     trainingLabels.append(targetTimesteps.astype(bool))
 
     lineTimesteps = np.vstack((line, np.zeros((5000-line.shape[0], 48))))
@@ -356,4 +358,4 @@ for trial in range(start,args.ntrain):
             savefig("%s-%08d.png"%(args.movie,trial),bbox_inches=0)
 
 npTrainingData = np.asarray(trainingData)
-model.fit(np.asarray([npTrainingData[0], npTrainingData[0]]), np.asarray(trainingLabels[0]), verbose=1)
+model.fit(np.asarray(npTrainingData[0]), np.asarray(trainingLabels[0]), batch_size=1, verbose=1)
