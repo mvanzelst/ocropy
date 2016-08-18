@@ -4,7 +4,7 @@ import random as pyrandom
 import re
 
 from keras.engine import Merge
-from keras.layers import LSTM, Activation, Dense, Dropout
+from keras.layers import LSTM, Activation, Dense, Dropout, Bidirectional, Embedding
 from keras.models import Sequential
 from keras.optimizers import Adam
 from keras.utils.np_utils import to_categorical
@@ -255,30 +255,23 @@ def plot_network_info(network,transcript,pred,gta):
 start = args.start if args.start>=0 else network.last_trial
 
 if args.keras:
-    ninput = args.height
-    nstates = args.hiddensize
-    noutput = codec.size()
+    data_dim = args.height
+    nstates = args.hiddensize # ??
+    nb_classes = codec.size()
+    timesteps = 5000
+
+    print(data_dim, nstates, nb_classes, timesteps)
 
     model = Sequential()
+    #model.add(Embedding(data_dim, data_dim, input_length=timesteps))
+    model.add(Bidirectional(LSTM(200, return_sequences=True), input_shape=(timesteps, data_dim), merge_mode='sum'))
+    model.add(Activation('softmax'))
 
-    forward = Sequential()
-    # forward.add(LSTM(output_dim=noutput, input_dim=ninput, input_length=nstates, return_sequences=True))
-    forward.add(LSTM(output_dim=noutput, return_sequences=False))
-    forward.add(Dropout(0.2))
-
-    backward = Sequential()
-    # backward.add(LSTM(output_dim=noutput, input_dim=ninput, return_sequences=True, go_backwards=True, input_length=nstates))
-    backward.add(LSTM(output_dim=noutput, go_backwards=True, return_sequences=False))
-    backward.add(Dropout(0.2))
-
-    model = Sequential()
-    model.add(Merge([forward, backward], mode='concat'))
-    model.add(Dense(output_dim=noutput, activation='softmax'))
-
-    model.compile(optimizer=Adam(), loss='binary_crossentropy')
+    model.compile(optimizer=Adam(), loss='categorical_crossentropy')
 
 trainingData = list()
 trainingLabels = list()
+
 
 for trial in range(start,args.ntrain):
     network.last_trial = trial+1
@@ -318,8 +311,8 @@ for trial in range(start,args.ntrain):
         line = vstack([zeros((args.pad,w)),line,zeros((args.pad,w))])
     cs = array(codec.encode(transcript),'i')
     target = lstm.make_target(cs, codec.size());
-    targetTimesteps = np.vstack((target, np.zeros((5000-target.shape[0], codec.size()))))
-    trainingLabels.append(targetTimesteps.astype(int))
+    targetTimesteps = np.vstack((target, np.zeros((200-target.shape[0], codec.size()))))
+    trainingLabels.append(targetTimesteps.astype(bool))
 
     lineTimesteps = np.vstack((line, np.zeros((5000-line.shape[0], 48))))
     trainingData.append(lineTimesteps)
@@ -363,4 +356,4 @@ for trial in range(start,args.ntrain):
             savefig("%s-%08d.png"%(args.movie,trial),bbox_inches=0)
 
 npTrainingData = np.asarray(trainingData)
-model.fit({'lstm_input_1': npTrainingData, 'lstm_input_2': npTrainingData}, np.asarray(trainingLabels), verbose=1)
+model.fit(np.asarray([npTrainingData[0], npTrainingData[0]]), np.asarray(trainingLabels[0]), verbose=1)
