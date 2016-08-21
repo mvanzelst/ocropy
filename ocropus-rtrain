@@ -388,7 +388,7 @@ if args.keras:
                 else:
                     self.cur_val_index += 1
                     if self.cur_val_index >= len(self.X):
-                        self.cur_val_index = val_split
+                        self.cur_val_index = self.val_split
                     index = self.cur_val_index
 
                 X_data[i, 0, :, :] = self.X[index]
