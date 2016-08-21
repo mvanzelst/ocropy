@@ -3,11 +3,15 @@
 import random as pyrandom
 import re
 
+import keras
+from keras.engine import Input
 from keras.engine import Merge
+from keras.engine import Model
+from keras.engine import merge
 from keras.layers import LSTM, Activation, Dense, Dropout, Bidirectional, Embedding, TimeDistributed, \
-    TimeDistributedDense
+    TimeDistributedDense, Convolution2D, MaxPooling2D, Reshape, Permute, GRU, Lambda, K
 from keras.models import Sequential
-from keras.optimizers import Adam
+from keras.optimizers import Adam, SGD
 from keras.utils.np_utils import to_categorical
 from pylab import *
 import os.path
@@ -255,27 +259,13 @@ def plot_network_info(network,transcript,pred,gta):
 
 start = args.start if args.start>=0 else network.last_trial
 
-if args.keras:
-    data_dim = args.height
-    nstates = args.hiddensize # ??
-    nb_classes = codec.size()
-    timesteps = 5000
-
-    print(data_dim, nstates, nb_classes, timesteps)
-
-    model = Sequential()
-    #model.add(Embedding(data_dim, data_dim, input_length=timesteps))
-    model.add(LSTM(nstates, batch_input_shape=(1, timesteps, data_dim), return_sequences=True))
-    model.add(Activation('relu'))
-    model.add(TimeDistributedDense(1, activation='softmax'))
-
-    model.compile(optimizer=Adam(), loss='binary_crossentropy')
-
+absolute_max_string_len=100
 trainingData = list()
 trainingLabels = list()
+img_h = 48
+img_w = 2000
 
-
-for trial in range(start,args.ntrain):
+for trial in range(start, args.ntrain):
     network.last_trial = trial+1
 
     do_display = (args.display>0 and trial%args.display==0)
@@ -312,12 +302,12 @@ for trial in range(start,args.ntrain):
         w = line.shape[1]
         line = vstack([zeros((args.pad,w)),line,zeros((args.pad,w))])
     cs = array(codec.encode(transcript),'i')
-    target = lstm.make_target(cs, codec.size());
-    targetTimesteps = np.vstack((target, np.zeros((5000-target.shape[0], codec.size()))))
-    trainingLabels.append(targetTimesteps.astype(bool))
+    targetTimesteps = np.hstack((cs, np.zeros((absolute_max_string_len-len(cs)))))
+    trainingLabels.append(targetTimesteps)
 
-    lineTimesteps = np.vstack((line, np.zeros((5000-line.shape[0], 48))))
-    trainingData.append(lineTimesteps)
+    # print line.shape[0]
+    lineTimesteps = np.vstack((line, np.zeros((img_w-line.shape[0], img_h))))
+    trainingData.append(lineTimesteps.transpose())
 
     continue
     try:
@@ -357,5 +347,152 @@ for trial in range(start,args.ntrain):
             draw()
             savefig("%s-%08d.png"%(args.movie,trial),bbox_inches=0)
 
-npTrainingData = np.asarray(trainingData)
-model.fit(np.asarray(npTrainingData[0]), np.asarray(trainingLabels[0]), batch_size=1, verbose=1)
+if args.keras:
+    class TextImageGenerator(keras.callbacks.Callback):
+
+        def __init__(self, X, Y, minibatch_size, img_w,
+                     img_h, downsample_width, val_split,
+                     absolute_max_string_len=16):
+
+            self.X = X
+            self.Y = Y
+            self.minibatch_size = minibatch_size
+            self.img_w = img_w
+            self.img_h = img_h
+            self.downsample_width = downsample_width
+            self.val_split = val_split
+            self.blank_label = self.get_output_size() - 1
+            self.absolute_max_string_len = absolute_max_string_len
+            self.cur_val_index = val_split
+            self.cur_train_index = 0
+
+        def get_output_size(self):
+            # return
+            return codec.size()
+
+        # each time an image is requested from train/val/test, a new random
+        # painting of the text is performed
+        def get_batch(self, size, train):
+            X_data = np.ones([size, 1, self.img_h, self.img_w])
+            labels = np.ones([size, self.absolute_max_string_len])
+            input_length = np.zeros([size, 1])
+            label_length = np.zeros([size, 1])
+            # source_str = []
+
+            for i in range(0, size):
+                if train:
+                    self.cur_train_index += 1
+                    if self.cur_train_index >= self.val_split:
+                        self.cur_train_index = 0
+                    index = self.cur_train_index
+                else:
+                    self.cur_val_index += 1
+                    if self.cur_val_index >= len(self.X):
+                        self.cur_val_index = val_split
+                    index = self.cur_val_index
+
+                X_data[i, 0, :, :] = self.X[index]
+                labels[i, :] = self.Y[index]
+                input_length[i] = self.downsample_width
+                label_length[i] = len(self.Y[index])
+                # source_str.append(self.X_text[index + i])
+
+            inputs = {'the_input': X_data,
+                      'the_labels': labels,
+                      'input_length': input_length,
+                      'label_length': label_length,
+                      # 'source_str': source_str  # used for visualization only
+                      }
+            outputs = {'ctc': np.zeros([size])}  # dummy data for dummy loss function
+            return (inputs, outputs)
+
+        def next_train(self):
+            while 1:
+                yield self.get_batch(self.minibatch_size, train=True)
+
+        def next_val(self):
+            while 1:
+                yield self.get_batch(self.minibatch_size, train=False)
+
+    def ctc_lambda_func(args):
+        y_pred, labels, input_length, label_length = args
+        # the 2 is critical here since the first couple outputs of the RNN
+        # tend to be garbage:
+        y_pred = y_pred[:, 2:, :]
+        return K.ctc_batch_cost(labels, y_pred, input_length, label_length)
+
+    nb_classes = codec.size()
+
+    # Input Parameters
+    nb_epoch = 50
+    minibatch_size = 32
+    images_per_epoch = len(trainingData)
+    val_split = 0.2
+    val_images = int(images_per_epoch * (val_split))
+
+    # Network parameters
+    conv_num_filters = 16
+    filter_size = 3
+    pool_size_1 = 4
+    pool_size_2 = 2
+    time_dense_size = 32
+    rnn_size = 100
+    time_steps = img_w / (pool_size_1 * pool_size_2)
+
+    act = 'relu'
+    input_data = Input(name='the_input', shape=(1, img_h, img_w), dtype='float32')
+    inner = Convolution2D(conv_num_filters, filter_size, filter_size, border_mode='same',
+                          activation=act, input_shape=(1, img_h, img_w), name='conv1')(input_data)
+    inner = MaxPooling2D(pool_size=(pool_size_1, pool_size_1), name='max1')(inner)
+    inner = Convolution2D(conv_num_filters, filter_size, filter_size, border_mode='same',
+                          activation=act, name='conv2')(inner)
+    inner = MaxPooling2D(pool_size=(pool_size_2, pool_size_2), name='max2')(inner)
+
+    conv_to_rnn_dims = ((img_h / (pool_size_1 * pool_size_2)) * conv_num_filters, img_w / (pool_size_1 * pool_size_2))
+    inner = Reshape(target_shape=conv_to_rnn_dims, name='reshape')(inner)
+    inner = Permute(dims=(2, 1), name='permute')(inner)
+
+    # cuts down input size going into RNN:
+    inner = TimeDistributed(Dense(time_dense_size, activation=act, name='dense1'))(inner)
+
+    # Two layers of bidirecitonal GRUs
+    # GRU seems to work as well, if not better than LSTM:
+    gru_1 = GRU(rnn_size, return_sequences=True, name='gru1')(inner)
+    gru_1b = GRU(rnn_size, return_sequences=True, go_backwards=True, name='gru1_b')(inner)
+    gru1_merged = merge([gru_1, gru_1b], mode='sum')
+    gru_2 = GRU(rnn_size, return_sequences=True, name='gru2')(gru1_merged)
+    gru_2b = GRU(rnn_size, return_sequences=True, go_backwards=True)(gru1_merged)
+
+    # transforms RNN output to character activations:
+    inner = TimeDistributed(Dense(nb_classes, name='dense2'))(merge([gru_2, gru_2b], mode='concat'))
+    y_pred = Activation('softmax', name='softmax')(inner)
+    Model(input=[input_data], output=y_pred).summary()
+
+    labels = Input(name='the_labels', shape=[absolute_max_string_len], dtype='float32')
+    input_length = Input(name='input_length', shape=[1], dtype='int64')
+    label_length = Input(name='label_length', shape=[1], dtype='int64')
+    # Keras doesn't currently support loss funcs with extra parameters
+    # so CTC loss is implemented in a lambda layer
+    loss_out = Lambda(ctc_lambda_func, output_shape=(1,), name="ctc")([y_pred, labels, input_length, label_length])
+
+    lr = 0.03
+    # clipnorm seems to speeds up convergence
+    clipnorm = 5
+    sgd = SGD(lr=lr, decay=3e-7, momentum=0.9, nesterov=True, clipnorm=clipnorm)
+
+    model = Model(input=[input_data, labels, input_length, label_length], output=[loss_out])
+
+    # the loss calc occurs elsewhere, so use a dummy lambda func for the loss
+    model.compile(loss={'ctc': lambda y_true, y_pred: y_pred}, optimizer=sgd)
+
+img_gen = TextImageGenerator(trainingData,
+                             trainingLabels,
+                             minibatch_size=minibatch_size,
+                             img_w=img_w,
+                             img_h=img_h,
+                             downsample_width=img_w / (pool_size_1 * pool_size_2) - 2,
+                             val_split=images_per_epoch - val_images,
+                             absolute_max_string_len=absolute_max_string_len)
+
+model.fit_generator(generator=img_gen.next_train(), samples_per_epoch=(images_per_epoch - val_images),
+                    nb_epoch=nb_epoch, validation_data=img_gen.next_val(), nb_val_samples=val_images)
