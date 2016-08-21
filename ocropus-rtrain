@@ -1,85 +1,25 @@
 #!/usr/bin/env python2
 
+import argparse
 import random as pyrandom
-import re
 
 import keras
+import numpy
 from keras.engine import Input
-from keras.engine import Merge
 from keras.engine import Model
 from keras.engine import merge
-from keras.layers import LSTM, Activation, Dense, Dropout, Bidirectional, Embedding, TimeDistributed, \
-    TimeDistributedDense, Convolution2D, MaxPooling2D, Reshape, Permute, GRU, Lambda, K
-from keras.models import Sequential
-from keras.optimizers import Adam, SGD
-from keras.utils.np_utils import to_categorical
-from pylab import *
-import os.path
-import ocrolib
-import argparse
-import matplotlib
-import numpy
+from keras.layers import Activation, Dense, TimeDistributed, \
+    Convolution2D, MaxPooling2D, Reshape, Permute, GRU, Lambda, K
+from keras.optimizers import SGD
 from ocrolib import lineest
+from pylab import *
+
+import ocrolib
 import ocrolib.lstm as lstm
-import traceback
-import unicodedata
 
 numpy.seterr(divide='raise',over='raise',invalid='raise',under='ignore')
 
 parser = argparse.ArgumentParser("train an RNN recognizer")
-
-# line normalization
-parser.add_argument("-e","--lineest",default="center",
-                    help="type of text line estimator, default: %(default)s")
-parser.add_argument("-E","--nolineest",action="store_true",
-                    help="don't perform line estimation and load .dew.png file")
-parser.add_argument("-l","--height",default=48,type=int,
-                    help="set the default height for line estimation, default: %(default)s")
-parser.add_argument("--dewarp",action="store_true",
-                    help="only perform line estimation and output .dew.png file")
-
-# character set
-parser.add_argument("-c","--codec",default=[],nargs='*',
-                    help="construct a codec from the input text")
-
-# learning
-parser.add_argument("-C","--clstm",action="store_true",
-                    help="use C++ LSTM")
-parser.add_argument("-K","--keras",action="store_true",
-                    help="use Keras")
-parser.add_argument("-r","--lrate",type=float,default=1e-4,
-                    help="LSTM learning rate, default: %(default)s")
-parser.add_argument("-S","--hiddensize",type=int,default=100,
-                    help="# LSTM state units, default: %(default)s")
-parser.add_argument("-o","--output",default=None,
-                    help="LSTM model file")
-parser.add_argument("-F","--savefreq",type=int,default=1000,
-                    help="LSTM save frequency, default: %(default)s")
-parser.add_argument("--strip",action="store_false",
-                    help="strip the model before saving")
-parser.add_argument("-N","--ntrain",type=int,default=1000000,
-                    help="# lines to train before stopping, default: %(default)s")
-parser.add_argument("-t","--tests",default=None,
-                    help="test cases for error estimation")
-parser.add_argument('--unidirectional',action="store_true",
-                    help="use only unidirectional LSTM")
-parser.add_argument("--updates",action="store_true",
-                    help="verbose LSTM updates")
-parser.add_argument('--load',default=None,
-                    help="start training with a previously trained model")
-parser.add_argument('--start',default=-1,type=int)
-
-# debugging
-parser.add_argument("-X","--exec",default="None",dest="execute",
-                    help="execute before anything else (usually used for imports)")
-parser.add_argument("-v","--verbose",action="store_true")
-parser.add_argument("-d","--display",type=int,default=0,
-                    help="display output for every nth iteration, where n=DISPLAY, default: %(default)s")
-parser.add_argument("-m","--movie",default=None)
-parser.add_argument("-M","--moviesample",default=None)
-parser.add_argument("-q","--quiet",action="store_true")
-parser.add_argument("-Q","--nocheck",action="store_true")
-parser.add_argument("-p","--pad",type=int,default=16)
 
 parser.add_argument("files",nargs="*")
 args = parser.parse_args()
@@ -91,65 +31,10 @@ if len(inputs)==0:
 
 print "# inputs",len(inputs)
 
-# pre-execute any python commands
-
-exec args.execute
-
-# make sure movie mode is used correctly
-
-if args.movie is not None:
-    if args.display<2:
-        print "you must set --display to some number greater than 1"
-        sys.exit(0)
-
-if args.moviesample is None:
-    args.moviesample = inputs[0]
-
-# make sure an output file has been set
-
-if args.output is None:
-    print "you must give an output file with %d in it, or a prefix"
-    sys.exit(0)
-
-if not "%" in args.output:
-    if args.clstm:
-        oname = args.output+"-%08d.h5"
-    else:
-        oname = args.output+"-%08d.pyrnn"
-else:
-    oname = args.output
-
-# get a separate test set, if present
-
-tests = None
-if args.tests is not None:
-    tests = ocrolib.glob_all(args.tests.split(":"))
-print "# tests",(len(tests) if tests is not None else "None")
-
-# load the line normalizer
-
-if args.lineest=="center":
-  lnorm = lineest.CenterNormalizer()
-else:
-  raise Exception(args.lineest+": unknown line normalizer")
-lnorm.setHeight(args.height)
-
 # The `codec` maps between strings and arrays of integers.
 
-if args.codec!=[]:
-    print "# building codec"
-    codec = lstm.Codec()
-    charset = set()
-    print args.codec
-    for fname in ocrolib.glob_all(args.codec):
-        transcript = ocrolib.read_text(fname)
-        l = list(lstm.normalize_nfkc(transcript))
-        charset = charset.union(l)
-    charset = sorted(list(charset))
-    charset = [c for c in charset if c>" " and c!="~"]
-else:
-    print "# using default codec"
-    charset = sorted(list(set(list(lstm.ascii_labels) + list(ocrolib.chars.default))))
+print "# using default codec"
+charset = sorted(list(set(list(lstm.ascii_labels) + list(ocrolib.chars.default))))
 
 charset = [""," ","~",]+[c for c in charset if c not in [" ","~"]]
 print "# charset size",len(charset),
@@ -159,334 +44,176 @@ else:
     s = "".join(charset)
     print "["+s[:20],"...",s[-20:]+"]"
 codec = lstm.Codec().init(charset)
-
-# Load an existing network or construct a new one
-# Somewhat convoluted logic for dealing with old style Python
-# modules and new style C++ LSTM networks.
-
-def save_lstm(fname,network):
-    if args.clstm:
-        network.lstm.save(fname)
-    else:
-        if args.strip:
-            network.clear_log()
-            for x in network.walk(): x.preSave()
-        ocrolib.save_object(fname,network)
-        if args.strip:
-            for x in network.walk(): x.postLoad()
-
-def load_lstm(fname):
-    if args.clstm:
-        network = lstm.SeqRecognizer(args.height,args.hiddensize,
-            codec=codec,
-            normalize=lstm.normalize_nfkc)
-        import clstm
-        mylstm = clstm.make_BIDILSTM()
-        mylstm.init(network.No,args.hiddensize,network.Ni)
-        mylstm.load(fname)
-        network.lstm = clstm.CNetwork(mylstm)
-        return network
-    else:
-        network = ocrolib.load_object(last_save)
-        network.upgrade()
-        for x in network.walk(): x.postLoad()
-        return network
-
-if args.load:
-    print "# loading",args.load
-    last_save = args.load
-    network = load_lstm(args.load)
-else:
-    last_save = None
-    network = lstm.SeqRecognizer(args.height,args.hiddensize,
-        codec=codec,
-        normalize=lstm.normalize_nfkc)
-    if args.clstm:
-        import clstm
-        mylstm = clstm.make_BIDILSTM()
-        mylstm.init(network.No,args.hiddensize,network.Ni)
-        network.lstm = clstm.CNetwork(mylstm)
-
-if getattr(network,"lnorm",None) is None:
-    network.lnorm = lnorm
-
-network.upgrade()
-if network.last_trial%100==99: network.last_trial += 1
-print "# last_trial",network.last_trial
+lnorm = lineest.CenterNormalizer()
+lnorm.setHeight(65)
 
 
-# set up the learning rate
+class TextImageGenerator(keras.callbacks.Callback):
 
-network.setLearningRate(args.lrate,0.9)
-if args.updates: network.lstm.verbose = 1
+    def __init__(self, inputs, minibatch_size, img_w,
+                 img_h, downsample_width, val_split,
+                 absolute_max_string_len=16):
 
-# used for plotting
+        pyrandom.seed(1337)
+        pyrandom.shuffle(inputs)
+        self.inputs = inputs
+        self.minibatch_size = minibatch_size
+        self.img_w = img_w
+        self.img_h = img_h
+        self.downsample_width = downsample_width
+        self.val_split = val_split
+        self.blank_label = self.get_output_size() - 1
+        self.absolute_max_string_len = absolute_max_string_len
+        self.cur_val_index = val_split
+        self.cur_train_index = 0
 
-ion()
-matplotlib.rc('xtick',labelsize=7)
-matplotlib.rc('ytick',labelsize=7)
-matplotlib.rcParams.update({"font.size":7})
+    def get_output_size(self):
+        # return
+        return codec.size()
 
-def cleandisp(s):
-    return re.sub('[$]',r'#',s)
+    # each time an image is requested from train/val/test, a new random
+    # painting of the text is performed
+    def get_batch(self, size, train):
+        X_data = np.ones([size, 1, self.img_h, self.img_w])
+        labels = np.ones([size, self.absolute_max_string_len])
+        input_length = np.zeros([size, 1])
+        label_length = np.zeros([size, 1])
+        # source_str = []
 
-def plot_network_info(network,transcript,pred,gta):
-    subplot(511)
-    imshow(line.T,cmap=cm.gray)
-    title(cleandisp(transcript))
-    subplot(512)
-    gca().set_xticks([])
-    imshow(network.outputs.T[1:],vmin=0,cmap=cm.hot)
-    title(cleandisp(pred[:len(transcript)]))
-    subplot(513)
-    imshow(network.aligned.T[1:],vmin=0,cmap=cm.hot)
-    title(cleandisp(gta[:len(transcript)]))
-    subplot(514)
-    plot(network.outputs[:,0],color='yellow',linewidth=3,alpha=0.5)
-    plot(network.outputs[:,1],color='green',linewidth=3,alpha=0.5)
-    plot(amax(network.outputs[:,2:],axis=1),color='blue',linewidth=3,alpha=0.5)
-    plot(network.aligned[:,0],color='orange',linestyle='dashed',alpha=0.7)
-    plot(network.aligned[:,1],color='green',linestyle='dashed',alpha=0.5)
-    plot(amax(network.aligned[:,2:],axis=1),color='blue',linestyle='dashed',alpha=0.5)
-    subplot(515)
-    gca().set_yscale('log')
-    r = 10000
-    errs = network.errors(range=r,smooth=100)
-    xs = arange(len(errs))+network.last_trial-len(errs)
-    plot(xs,errs,color='black')
-    plot(xs,network.errors(range=r),color='black',alpha=0.4)
-    plot(xs,network.cerrors(range=r,smooth=100),color='red',linestyle='dashed')
+        for i in range(0, size):
+            if train:
+                self.cur_train_index += 1
+                if self.cur_train_index >= self.val_split:
+                    self.cur_train_index = 0
+                index = self.cur_train_index
+            else:
+                self.cur_val_index += 1
+                if self.cur_val_index >= len(self.X):
+                    self.cur_val_index = self.val_split
+                index = self.cur_val_index
 
-start = args.start if args.start>=0 else network.last_trial
+            fname = self.inputs[index]
+            base,_ = ocrolib.allsplitext(fname)
 
+            line = ocrolib.read_image_gray(fname)
+            lnorm.measure(amax(line)-line)
+            line = lnorm.normalize(line, cval=amax(line))
+            # if line.size<10 or amax(line)==amin(line):
+            #     print "EMPTY-INPUT"
+            #     continue
+
+            line = line * 1.0/amax(line)
+            line = amax(line)-line
+            line = line.T
+
+            w = line.shape[1]
+            line = vstack([zeros((16,w)),line,zeros((16,w))])
+            transcript = ocrolib.read_text(base+".gt.txt")
+
+            cs = array(codec.encode(transcript),'i')
+            targetTimesteps = np.hstack((cs, np.zeros((self.absolute_max_string_len-len(cs)))))
+
+            # print line.shape[0]
+            lineTimesteps = np.vstack((line, np.zeros((self.img_w-line.shape[0], self.img_h))))
+
+            X_data[i, 0, :, :] = lineTimesteps.transpose()
+            labels[i, :] = targetTimesteps
+            input_length[i] = self.downsample_width
+            label_length[i] = len(targetTimesteps)
+            # source_str.append(self.X_text[index + i])
+
+        inputs = {'the_input': X_data,
+                  'the_labels': labels,
+                  'input_length': input_length,
+                  'label_length': label_length,
+                  # 'source_str': source_str  # used for visualization only
+                  }
+        outputs = {'ctc': np.zeros([size])}  # dummy data for dummy loss function
+        return (inputs, outputs)
+
+    def next_train(self):
+        while 1:
+            yield self.get_batch(self.minibatch_size, train=True)
+
+    def next_val(self):
+        while 1:
+            yield self.get_batch(self.minibatch_size, train=False)
+
+def ctc_lambda_func(args):
+    y_pred, labels, input_length, label_length = args
+    # the 2 is critical here since the first couple outputs of the RNN
+    # tend to be garbage:
+    y_pred = y_pred[:, 2:, :]
+    return K.ctc_batch_cost(labels, y_pred, input_length, label_length)
+
+nb_classes = codec.size()
+
+# Input Parameters
 absolute_max_string_len=100
-trainingData = list()
-trainingLabels = list()
-img_h = 48
+img_h = 65
 img_w = 2000
+nb_epoch = 50
+minibatch_size = 32
+images_per_epoch = len(inputs)
+val_split = 0.2
+val_images = int(images_per_epoch * (val_split))
 
-for trial in range(start, args.ntrain):
-    network.last_trial = trial+1
+# Network parameters
+conv_num_filters = 16
+filter_size = 3
+pool_size_1 = 4
+pool_size_2 = 2
+time_dense_size = 32
+rnn_size = 100
+time_steps = img_w / (pool_size_1 * pool_size_2)
 
-    do_display = (args.display>0 and trial%args.display==0)
-    do_update = 1
+act = 'relu'
+input_data = Input(name='the_input', shape=(1, img_h, img_w), dtype='float32')
+inner = Convolution2D(conv_num_filters, filter_size, filter_size, border_mode='same',
+                      activation=act, input_shape=(1, img_h, img_w), name='conv1')(input_data)
+inner = MaxPooling2D(pool_size=(pool_size_1, pool_size_1), name='max1')(inner)
+inner = Convolution2D(conv_num_filters, filter_size, filter_size, border_mode='same',
+                      activation=act, name='conv2')(inner)
+inner = MaxPooling2D(pool_size=(pool_size_2, pool_size_2), name='max2')(inner)
 
-    if args.movie and do_display:
-        fname = args.moviesample
-        do_update = 0
-    else:
-        fname = pyrandom.sample(inputs,1)[0]
+conv_to_rnn_dims = ((img_h / (pool_size_1 * pool_size_2)) * conv_num_filters, img_w / (pool_size_1 * pool_size_2))
+inner = Reshape(target_shape=conv_to_rnn_dims, name='reshape')(inner)
+inner = Permute(dims=(2, 1), name='permute')(inner)
 
-    base,_ = ocrolib.allsplitext(fname)
-    try:
-        line = ocrolib.read_image_gray(fname)
-        transcript = ocrolib.read_text(base+".gt.txt")
-    except IOError as e:
-        print "ERROR",e
-        continue
+# cuts down input size going into RNN:
+inner = TimeDistributed(Dense(time_dense_size, activation=act, name='dense1'))(inner)
 
-    if not args.nolineest:
-        assert "dew.png" not in fname,"don't dewarp already dewarped lines"
-        network.lnorm.measure(amax(line)-line)
-        line = network.lnorm.normalize(line,cval=amax(line))
-    else:
-        assert "dew.png" in fname,"input must already be dewarped"
+# Two layers of bidirecitonal GRUs
+# GRU seems to work as well, if not better than LSTM:
+gru_1 = GRU(rnn_size, return_sequences=True, name='gru1')(inner)
+gru_1b = GRU(rnn_size, return_sequences=True, go_backwards=True, name='gru1_b')(inner)
+gru1_merged = merge([gru_1, gru_1b], mode='sum')
+gru_2 = GRU(rnn_size, return_sequences=True, name='gru2')(gru1_merged)
+gru_2b = GRU(rnn_size, return_sequences=True, go_backwards=True)(gru1_merged)
 
-    if line.size<10 or amax(line)==amin(line):
-        print "EMPTY-INPUT"
-        continue
-    line = line * 1.0/amax(line)
-    line = amax(line)-line
-    line = line.T
-    if args.pad>0:
-        w = line.shape[1]
-        line = vstack([zeros((args.pad,w)),line,zeros((args.pad,w))])
-    cs = array(codec.encode(transcript),'i')
-    targetTimesteps = np.hstack((cs, np.zeros((absolute_max_string_len-len(cs)))))
-    trainingLabels.append(targetTimesteps)
+# transforms RNN output to character activations:
+inner = TimeDistributed(Dense(nb_classes, name='dense2'))(merge([gru_2, gru_2b], mode='concat'))
+y_pred = Activation('softmax', name='softmax')(inner)
+Model(input=[input_data], output=y_pred).summary()
 
-    # print line.shape[0]
-    lineTimesteps = np.vstack((line, np.zeros((img_w-line.shape[0], img_h))))
-    trainingData.append(lineTimesteps.transpose())
+labels = Input(name='the_labels', shape=[absolute_max_string_len], dtype='float32')
+input_length = Input(name='input_length', shape=[1], dtype='int64')
+label_length = Input(name='label_length', shape=[1], dtype='int64')
+# Keras doesn't currently support loss funcs with extra parameters
+# so CTC loss is implemented in a lambda layer
+loss_out = Lambda(ctc_lambda_func, output_shape=(1,), name="ctc")([y_pred, labels, input_length, label_length])
 
-    continue
-    try:
-        pcs = network.trainSequence(line,cs,update=do_update,key=fname)
-    except FloatingPointError as e:
-        print "# oops, got FloatingPointError",e
-        traceback.print_exc()
-        network = load_lstm(last_save)
-        continue
-    except lstm.RangeError as e:
-        continue
-    pred = "".join(codec.decode(pcs))
-    acs = lstm.translate_back(network.aligned)
-    gta = "".join(codec.decode(acs))
-    if not args.quiet:
-        print "%d %.2f %s"%(trial,network.error,line.shape),fname
-        print "   TRU:",repr(transcript)
-        print "   ALN:",repr(gta[:len(transcript)+5])
-        print "   OUT:",repr(pred[:len(transcript)+5])
+lr = 0.03
+# clipnorm seems to speeds up convergence
+clipnorm = 5
+sgd = SGD(lr=lr, decay=3e-7, momentum=0.9, nesterov=True, clipnorm=clipnorm)
 
-    pred = re.sub(' ','_',pred)
-    gta = re.sub(' ','_',gta)
+model = Model(input=[input_data, labels, input_length, label_length], output=[loss_out])
 
-    if (trial+1)%args.savefreq==0:
-        ofile = oname%(trial+1)+".gz"
-        print "# saving",ofile
-        save_lstm(ofile,network)
-        last_save = ofile
+# the loss calc occurs elsewhere, so use a dummy lambda func for the loss
+model.compile(loss={'ctc': lambda y_true, y_pred: y_pred}, optimizer=sgd)
 
-    if do_display:
-        figure("training",figsize=(1400//75,800//75),dpi=75)
-        clf()
-        gcf().canvas.set_window_title(args.output)
-        plot_network_info(network,transcript,pred,gta)
-        ginput(1,0.01)
-        if args.movie is not None:
-            draw()
-            savefig("%s-%08d.png"%(args.movie,trial),bbox_inches=0)
-
-if args.keras:
-    class TextImageGenerator(keras.callbacks.Callback):
-
-        def __init__(self, X, Y, minibatch_size, img_w,
-                     img_h, downsample_width, val_split,
-                     absolute_max_string_len=16):
-
-            self.X = X
-            self.Y = Y
-            self.minibatch_size = minibatch_size
-            self.img_w = img_w
-            self.img_h = img_h
-            self.downsample_width = downsample_width
-            self.val_split = val_split
-            self.blank_label = self.get_output_size() - 1
-            self.absolute_max_string_len = absolute_max_string_len
-            self.cur_val_index = val_split
-            self.cur_train_index = 0
-
-        def get_output_size(self):
-            # return
-            return codec.size()
-
-        # each time an image is requested from train/val/test, a new random
-        # painting of the text is performed
-        def get_batch(self, size, train):
-            X_data = np.ones([size, 1, self.img_h, self.img_w])
-            labels = np.ones([size, self.absolute_max_string_len])
-            input_length = np.zeros([size, 1])
-            label_length = np.zeros([size, 1])
-            # source_str = []
-
-            for i in range(0, size):
-                if train:
-                    self.cur_train_index += 1
-                    if self.cur_train_index >= self.val_split:
-                        self.cur_train_index = 0
-                    index = self.cur_train_index
-                else:
-                    self.cur_val_index += 1
-                    if self.cur_val_index >= len(self.X):
-                        self.cur_val_index = self.val_split
-                    index = self.cur_val_index
-
-                X_data[i, 0, :, :] = self.X[index]
-                labels[i, :] = self.Y[index]
-                input_length[i] = self.downsample_width
-                label_length[i] = len(self.Y[index])
-                # source_str.append(self.X_text[index + i])
-
-            inputs = {'the_input': X_data,
-                      'the_labels': labels,
-                      'input_length': input_length,
-                      'label_length': label_length,
-                      # 'source_str': source_str  # used for visualization only
-                      }
-            outputs = {'ctc': np.zeros([size])}  # dummy data for dummy loss function
-            return (inputs, outputs)
-
-        def next_train(self):
-            while 1:
-                yield self.get_batch(self.minibatch_size, train=True)
-
-        def next_val(self):
-            while 1:
-                yield self.get_batch(self.minibatch_size, train=False)
-
-    def ctc_lambda_func(args):
-        y_pred, labels, input_length, label_length = args
-        # the 2 is critical here since the first couple outputs of the RNN
-        # tend to be garbage:
-        y_pred = y_pred[:, 2:, :]
-        return K.ctc_batch_cost(labels, y_pred, input_length, label_length)
-
-    nb_classes = codec.size()
-
-    # Input Parameters
-    nb_epoch = 50
-    minibatch_size = 32
-    images_per_epoch = len(trainingData)
-    val_split = 0.2
-    val_images = int(images_per_epoch * (val_split))
-
-    # Network parameters
-    conv_num_filters = 16
-    filter_size = 3
-    pool_size_1 = 4
-    pool_size_2 = 2
-    time_dense_size = 32
-    rnn_size = 100
-    time_steps = img_w / (pool_size_1 * pool_size_2)
-
-    act = 'relu'
-    input_data = Input(name='the_input', shape=(1, img_h, img_w), dtype='float32')
-    inner = Convolution2D(conv_num_filters, filter_size, filter_size, border_mode='same',
-                          activation=act, input_shape=(1, img_h, img_w), name='conv1')(input_data)
-    inner = MaxPooling2D(pool_size=(pool_size_1, pool_size_1), name='max1')(inner)
-    inner = Convolution2D(conv_num_filters, filter_size, filter_size, border_mode='same',
-                          activation=act, name='conv2')(inner)
-    inner = MaxPooling2D(pool_size=(pool_size_2, pool_size_2), name='max2')(inner)
-
-    conv_to_rnn_dims = ((img_h / (pool_size_1 * pool_size_2)) * conv_num_filters, img_w / (pool_size_1 * pool_size_2))
-    inner = Reshape(target_shape=conv_to_rnn_dims, name='reshape')(inner)
-    inner = Permute(dims=(2, 1), name='permute')(inner)
-
-    # cuts down input size going into RNN:
-    inner = TimeDistributed(Dense(time_dense_size, activation=act, name='dense1'))(inner)
-
-    # Two layers of bidirecitonal GRUs
-    # GRU seems to work as well, if not better than LSTM:
-    gru_1 = GRU(rnn_size, return_sequences=True, name='gru1')(inner)
-    gru_1b = GRU(rnn_size, return_sequences=True, go_backwards=True, name='gru1_b')(inner)
-    gru1_merged = merge([gru_1, gru_1b], mode='sum')
-    gru_2 = GRU(rnn_size, return_sequences=True, name='gru2')(gru1_merged)
-    gru_2b = GRU(rnn_size, return_sequences=True, go_backwards=True)(gru1_merged)
-
-    # transforms RNN output to character activations:
-    inner = TimeDistributed(Dense(nb_classes, name='dense2'))(merge([gru_2, gru_2b], mode='concat'))
-    y_pred = Activation('softmax', name='softmax')(inner)
-    Model(input=[input_data], output=y_pred).summary()
-
-    labels = Input(name='the_labels', shape=[absolute_max_string_len], dtype='float32')
-    input_length = Input(name='input_length', shape=[1], dtype='int64')
-    label_length = Input(name='label_length', shape=[1], dtype='int64')
-    # Keras doesn't currently support loss funcs with extra parameters
-    # so CTC loss is implemented in a lambda layer
-    loss_out = Lambda(ctc_lambda_func, output_shape=(1,), name="ctc")([y_pred, labels, input_length, label_length])
-
-    lr = 0.03
-    # clipnorm seems to speeds up convergence
-    clipnorm = 5
-    sgd = SGD(lr=lr, decay=3e-7, momentum=0.9, nesterov=True, clipnorm=clipnorm)
-
-    model = Model(input=[input_data, labels, input_length, label_length], output=[loss_out])
-
-    # the loss calc occurs elsewhere, so use a dummy lambda func for the loss
-    model.compile(loss={'ctc': lambda y_true, y_pred: y_pred}, optimizer=sgd)
-
-img_gen = TextImageGenerator(trainingData,
-                             trainingLabels,
+img_gen = TextImageGenerator(inputs,
                              minibatch_size=minibatch_size,
                              img_w=img_w,
                              img_h=img_h,
