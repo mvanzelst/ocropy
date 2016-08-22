@@ -44,8 +44,6 @@ else:
     s = "".join(charset)
     print "["+s[:20],"...",s[-20:]+"]"
 codec = lstm.Codec().init(charset)
-lnorm = lineest.CenterNormalizer()
-lnorm.setHeight(65)
 
 
 class TextImageGenerator(keras.callbacks.Callback):
@@ -88,12 +86,15 @@ class TextImageGenerator(keras.callbacks.Callback):
                 index = self.cur_train_index
             else:
                 self.cur_val_index += 1
-                if self.cur_val_index >= len(self.X):
+                if self.cur_val_index >= len(self.inputs):
                     self.cur_val_index = self.val_split
                 index = self.cur_val_index
 
             fname = self.inputs[index]
-            base,_ = ocrolib.allsplitext(fname)
+            base, _ = ocrolib.allsplitext(fname)
+
+            lnorm = lineest.CenterNormalizer()
+            lnorm.setHeight(65)
 
             line = ocrolib.read_image_gray(fname)
             lnorm.measure(amax(line)-line)
@@ -151,7 +152,7 @@ nb_classes = codec.size()
 # Input Parameters
 absolute_max_string_len=100
 img_h = 65
-img_w = 2000
+img_w = 3000
 nb_epoch = 50
 minibatch_size = 32
 images_per_epoch = len(inputs)
@@ -222,4 +223,6 @@ img_gen = TextImageGenerator(inputs,
                              absolute_max_string_len=absolute_max_string_len)
 
 model.fit_generator(generator=img_gen.next_train(), samples_per_epoch=(images_per_epoch - val_images),
-                    nb_epoch=nb_epoch, validation_data=img_gen.next_val(), nb_val_samples=val_images)
+                    nb_epoch=nb_epoch, validation_data=img_gen.next_val(), nb_val_samples=val_images, verbose=2)
+
+model.save('models/krant.h5')
